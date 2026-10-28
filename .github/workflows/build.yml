@@ -1,0 +1,51 @@
+name: Compilar Black para iOS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-14
+
+    steps:
+    - name: 1. Baixar o código do repositório
+      uses: actions/checkout@v4
+
+    - name: 2. Instalar ferramentas de compilação do Mac
+      run: |
+        brew install cmake ninja python
+        pip3 install gdown
+
+    - name: 3. Criar pasta e Baixar a ISO do Google Drive
+      run: |
+        mkdir -p iso
+        gdown --id 1kMa2gBq3QHfP_ZLe-SVwJvrop1fM7-U7 -O iso/"Black (USA).iso"
+
+    - name: 4. Executar Scripts Preparatórios
+      run: |
+        chmod +x scripts/*.sh
+        ./scripts/build-apple.sh
+        ./scripts/fetch-deps.sh ios
+        ./scripts/apply-sdk-patches.sh
+
+    - name: 5. Gerar o projeto do Xcode via CMake
+      run: |
+        cmake -B build -G Xcode \
+          -DCMAKE_TOOLCHAIN_FILE=cmake/ios.toolchain.cmake \
+          -DPLATFORM=OS64COMBINED
+
+    - name: 6. Compilar o Jogo
+      run: |
+        cmake --build build --config Release
+
+    - name: 7. Empacotar o Jogo em Formato .ipa
+      run: |
+        mkdir -p Payload
+        cp -R build/Release-iphoneos/*.app Payload/ 2>/dev/null || cp -R build/*.app Payload/
+        zip -r BlackJogo.ipa Payload
+        
+    - name: 8. Disponibilizar o arquivo IPA para Download
+      uses: actions/upload-artifact@v4
+      with:
+        name: jogo-black-ios
+        path: BlackJogo.ipa

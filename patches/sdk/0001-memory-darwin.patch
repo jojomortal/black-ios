@@ -1,0 +1,126 @@
+diff --git a/runtime/kernel/memory.cpp b/runtime/kernel/memory.cpp
+index be024fa..ca619f8 100644
+--- a/runtime/kernel/memory.cpp
++++ b/runtime/kernel/memory.cpp
+@@ -1,6 +1,7 @@
+ #include "kernel/memory.h"
+ 
+ #include <algorithm>
++#include <cerrno>
+ #include <cstring>
+ #include <map>
+ #include <mutex>
+@@ -13,6 +14,11 @@
+ #include <windows.h>
+ #else
+ #include <sys/mman.h>
++#ifdef __APPLE__
++#include <mach/mach.h>
++#include <mach/vm_map.h>
++#include <unistd.h>
++#endif
+ #endif
+ 
+ namespace mem {
+@@ -54,6 +60,47 @@ bool Init() {
+         UnmapViewOfFile(b + kContiguousBase);
+         UnmapViewOfFile(b + kWriteCombineBase);
+     }
++#elif defined(__APPLE__)
++    // no memfd and iOS has no shm_open (sandbox): one memory entry mapped at both windows, over the reservation.
++    // the hint is ignored by Darwin, the guest only needs g_base
++    void* p = mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
++    g_base = p == MAP_FAILED ? nullptr : static_cast<uint8_t*>(p);
++    int failed_errno = g_base ? 0 : errno;
++    kern_return_t failed_kr = KERN_SUCCESS;
++    if (g_base) {
++        memory_object_size_t entry_size = kPhysicalSize;
++        mach_port_t entry = MACH_PORT_NULL;
++        failed_kr = mach_make_memory_entry_64(mach_task_self(), &entry_size, 0, MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE,
++                                              &entry, MACH_PORT_NULL);
++        bool ok = failed_kr == KERN_SUCCESS;
++        for (uint64_t at : {uint64_t(kContiguousBase), uint64_t(kWriteCombineBase)}) {
++            vm_address_t where = reinterpret_cast<vm_address_t>(g_base + at);
++            if (!ok) continue;
++            failed_kr = vm_map(mach_task_self(), &where, kPhysicalSize, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, entry, 0, FALSE,
++                               VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
++            ok = failed_kr == KERN_SUCCESS;
++        }
++        // the mappings keep the memory alive
++        if (entry != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), entry);
++        if (!ok) {
++            munmap(g_base, size);
++            g_base = nullptr;
++        }
++    }
++    if (!g_base) {
++        // what a failure on a device needs: the errno / kern_return of the step that failed, and how much would fit
++        uint64_t fits = 0;
++        for (uint64_t try_size = size >> 1; try_size >= (256ull << 20) && !fits; try_size >>= 1) {
++            void* q = mmap(nullptr, try_size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
++            if (q != MAP_FAILED) {
++                munmap(q, try_size);
++                fits = try_size;
++            }
++        }
++        LOGE("memory: reserve failed: errno %d (%s), kern_return %d (%s), largest reservation that works: %llu MB",
++             failed_errno, strerror(failed_errno), failed_kr, mach_error_string(failed_kr),
++             static_cast<unsigned long long>(fits >> 20));
++    }
+ #else
+     void* p = mmap(reinterpret_cast<void*>(0x100000000ull), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+     g_base = p == MAP_FAILED ? nullptr : static_cast<uint8_t*>(p);
+@@ -71,6 +118,13 @@ bool Init() {
+     return true;
+ }
+ 
++#ifdef __APPLE__
++static uint64_t HostPage() {
++    static const uint64_t page = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
++    return page;
++}
++#endif
++
+ // page commit map, one byte per 4 KB page
+ static std::vector<uint8_t> g_committed(0x100000, 0);
+ 
+@@ -84,6 +138,14 @@ bool Commit(uint32_t va, uint32_t size) {
+         LOGE("memory: commit %08X+%X failed", first, uint32_t(end - first));
+         return false;
+     }
++#elif defined(__APPLE__)
++    // host pages are 16 KB on arm64: protect the whole host pages around the guest range
++    const uint64_t host = HostPage();
++    const uint64_t hfirst = first & ~(host - 1), hend = (end + host - 1) & ~(host - 1);
++    if (mprotect(g_base + hfirst, size_t(hend - hfirst), PROT_READ | PROT_WRITE)) {
++        LOGE("memory: commit %08X+%X failed", first, uint32_t(end - first));
++        return false;
++    }
+ #else
+     if (mprotect(g_base + first, size_t(end - first), PROT_READ | PROT_WRITE)) {
+         LOGE("memory: commit %08X+%X failed", first, uint32_t(end - first));
+@@ -101,6 +163,24 @@ void Decommit(uint32_t va, uint32_t size) {
+     std::lock_guard<std::recursive_mutex> lock(g_lock);
+ #ifdef _WIN32
+     VirtualFree(g_base + first, size_t(end - first), MEM_DECOMMIT);
++#elif defined(__APPLE__)
++    // a host page goes only when none of its guest pages is committed any more: clear the bits, then release the
++    // free host pages. MADV_DONTNEED does not zero on Darwin, so they are replaced by a fresh PROT_NONE mapping
++    for (uint64_t p = first; p < end; p += kPage) g_committed[size_t(p >> 12)] = 0;
++    const uint64_t host = HostPage();
++    const uint64_t hfirst = first & ~(host - 1), hend = (end + host - 1) & ~(host - 1);
++    bool open_run = false;  // a run of free host pages is pending, from run_start
++    uint64_t run_start = 0;
++    for (uint64_t h = hfirst; h <= hend; h += host) {
++        bool free = h < hend;
++        for (uint64_t p = h; free && p < h + host; p += kPage) free = !g_committed[size_t(p >> 12)];
++        if (free && !open_run) open_run = true, run_start = h;
++        if (!free && open_run) {
++            mmap(g_base + run_start, size_t(h - run_start), PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED | MAP_NORESERVE, -1, 0);
++            open_run = false;
++        }
++    }
++    return;
+ #else
+     madvise(g_base + first, size_t(end - first), MADV_DONTNEED);
+     mprotect(g_base + first, size_t(end - first), PROT_NONE);
